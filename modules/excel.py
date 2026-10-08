@@ -1,90 +1,90 @@
-"""Excel (.xlsx) via Microsoft Graph Workbook API."""
+"""Excel (.xlsx) via Workbook API da Graph."""
 
-from __future__ import annotations
+import re
+from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import graph
+from graph import odata_str
 
 
-def register(mcp: FastMCP) -> None:
+def _sheet(item_id: str, sheet_name: str) -> str:
+    return f"/me/drive/items/{item_id}/workbook/worksheets/{quote(sheet_name, safe='')}"
+
+
+def _range(item_id: str, sheet_name: str, address: str) -> str:
+    return f"{_sheet(item_id, sheet_name)}/range(address='{quote(odata_str(address), safe=':')}')"
+
+
+def register(mcp: MCPServer) -> None:
 
     @mcp.tool()
-    async def excel_read_sheet(item_id: str, sheet_name: str) -> list[list]:
-        """Lê todas as linhas usadas de uma aba do Excel.
+    async def excel_read_sheet(item_id: str, sheet_name: str) -> dict:
+        """Lê todas as células usadas de uma aba do Excel.
 
         Args:
             item_id: ID do arquivo .xlsx no OneDrive.
             sheet_name: Nome da aba (worksheet).
         """
-        data = await graph.get(
-            f"/me/drive/items/{item_id}/workbook/worksheets/{sheet_name}/usedRange"
-        )
-        return data.get("values", [])
+        data = await graph.get(f"{_sheet(item_id, sheet_name)}/usedRange(valuesOnly=true)")
+        return {"address": data.get("address"), "values": data.get("values", [])}
 
     @mcp.tool()
     async def excel_append_row(item_id: str, sheet_name: str, values: list) -> dict:
-        """Adiciona uma linha ao final dos dados de uma aba.
+        """Adiciona uma linha logo abaixo da última linha usada da aba, a partir da coluna A.
 
         Args:
             item_id: ID do arquivo .xlsx.
             sheet_name: Nome da aba.
-            values: Lista de valores a inserir, ex: ['João', 30, 'SP'].
+            values: Valores da nova linha, ex: ['João', 30, 'SP'].
         """
         used = await graph.get(
-            f"/me/drive/items/{item_id}/workbook/worksheets/{sheet_name}/usedRange"
+            f"{_sheet(item_id, sheet_name)}/usedRange(valuesOnly=true)",
+            params={"$select": "address,values"},
         )
-        row_count = used.get("rowCount", 0)
-        col_count = max(len(values), used.get("columnCount", 1))
-
-        def col_letter(n: int) -> str:
-            s = ""
-            while n > 0:
-                n, r = divmod(n - 1, 26)
-                s = chr(65 + r) + s
-            return s
-
-        target_row = row_count + 1
-        end_col = col_letter(col_count)
-        address = f"A{target_row}:{end_col}{target_row}"
-
-        await graph.patch(
-            f"/me/drive/items/{item_id}/workbook/worksheets/{sheet_name}/range(address='{address}')",
-            {"values": [values]},
-        )
-        return {"address": address, "rowsAdded": 1}
+        is_empty = used.get("values") in (None, [[""]], [[None]])
+        last_row = 0 if is_empty else int(re.search(r"(\d+)$", used["address"]).group(1))
+        target = last_row + 1
+        address = f"A{target}:{_col_letter(len(values))}{target}"
+        await graph.patch(_range(item_id, sheet_name, address), {"values": [values]})
+        return {"address": address}
 
     @mcp.tool()
     async def excel_delete_row(item_id: str, sheet_name: str, row_index: int) -> str:
-        """Deleta uma linha pelo índice (0-based, sem contar o cabeçalho).
+        """Remove uma linha de dados e desloca as de baixo para cima.
 
         Args:
             item_id: ID do arquivo .xlsx.
             sheet_name: Nome da aba.
-            row_index: Índice da linha de dados (0 = primeira linha após o cabeçalho).
+            row_index: Índice 0-based da linha de dados, sem contar o cabeçalho
+                (0 = primeira linha após o cabeçalho, ou seja, a linha 2 do Excel).
         """
-        # Linha 1 é o cabeçalho; dados começam na linha 2
         excel_row = row_index + 2
         await graph.post(
-            f"/me/drive/items/{item_id}/workbook/worksheets/{sheet_name}/rows/{excel_row}/delete",
-            {},
+            f"{_range(item_id, sheet_name, f'{excel_row}:{excel_row}')}/delete", {"shift": "Up"}
         )
-        return f"Linha {row_index} (Excel linha {excel_row}) deletada."
+        return f"Linha {excel_row} do Excel removida."
 
     @mcp.tool()
     async def excel_update_cell(
-        item_id: str, sheet_name: str, cell: str, value: str | int | float
+        item_id: str, sheet_name: str, cell: str, value: str | int | float | bool
     ) -> dict:
-        """Atualiza o valor de uma célula específica.
+        """Atualiza o valor de uma célula. Textos iniciados com '=' são gravados como fórmula.
 
         Args:
             item_id: ID do arquivo .xlsx.
             sheet_name: Nome da aba.
             cell: Endereço da célula, ex: 'B5'.
-            value: Novo valor da célula.
+            value: Novo valor.
         """
-        await graph.patch(
-            f"/me/drive/items/{item_id}/workbook/worksheets/{sheet_name}/range(address='{cell}')",
-            {"values": [[value]]},
-        )
+        await graph.patch(_range(item_id, sheet_name, cell), {"values": [[value]]})
         return {"cell": cell, "value": value}
+
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s

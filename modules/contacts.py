@@ -1,13 +1,11 @@
 """Contatos do Outlook via Microsoft Graph API."""
 
-from __future__ import annotations
-
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import graph
 
 
-def register(mcp: FastMCP) -> None:
+def register(mcp: MCPServer) -> None:
 
     @mcp.tool()
     async def contacts_list(limit: int = 50) -> list[dict]:

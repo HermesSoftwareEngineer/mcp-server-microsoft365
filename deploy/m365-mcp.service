@@ -1,0 +1,23 @@
+[Unit]
+Description=MCP Server Microsoft 365
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=m365mcp
+Group=m365mcp
+WorkingDirectory=/opt/m365-mcp
+EnvironmentFile=/opt/m365-mcp/.env
+ExecStart=/opt/m365-mcp/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/m365-mcp/data
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

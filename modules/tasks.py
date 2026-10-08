@@ -1,13 +1,11 @@
 """Microsoft To Do via Microsoft Graph API."""
 
-from __future__ import annotations
-
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import graph
 
 
-def register(mcp: FastMCP) -> None:
+def register(mcp: MCPServer) -> None:
 
     @mcp.tool()
     async def tasks_list_lists() -> list[dict]:

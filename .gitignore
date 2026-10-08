@@ -1,5 +1,5 @@
 .env
-.tokens.json
+data/
 __pycache__/
 *.py[cod]
 .venv/

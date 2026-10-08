@@ -1,13 +1,27 @@
-"""Outlook Mail via Microsoft Graph API."""
+"""Outlook — e-mail."""
 
-from __future__ import annotations
-
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import graph
+from graph import odata_str
 
 
-def register(mcp: FastMCP) -> None:
+def _summary(m: dict) -> dict:
+    return {
+        "id": m["id"],
+        "subject": m.get("subject"),
+        "from": m.get("from", {}).get("emailAddress", {}).get("address"),
+        "received": m.get("receivedDateTime"),
+        "isRead": m.get("isRead"),
+        "preview": m.get("bodyPreview"),
+    }
+
+
+def _recipients(addresses: list[str]) -> list[dict]:
+    return [{"emailAddress": {"address": a}} for a in addresses]
+
+
+def register(mcp: MCPServer) -> None:
 
     @mcp.tool()
     async def mail_list(
@@ -15,56 +29,53 @@ def register(mcp: FastMCP) -> None:
         from_address: str | None = None,
         subject: str | None = None,
         since: str | None = None,
+        unread_only: bool = False,
         limit: int = 20,
     ) -> list[dict]:
-        """Lista e-mails com filtros opcionais.
+        """Lista e-mails de uma pasta, do mais recente para o mais antigo.
 
         Args:
-            folder: Pasta do Outlook: 'inbox', 'sentitems', 'drafts', 'deleteditems'. Padrão: 'inbox'.
-            from_address: Filtrar por endereço do remetente.
-            subject: Filtrar por texto no assunto (contém).
-            since: Filtrar por data mínima, ex: '2025-01-01'.
-            limit: Número máximo de e-mails. Padrão: 20.
+            folder: Pasta: 'inbox', 'sentitems', 'drafts', 'deleteditems', 'archive' ou ID de pasta.
+            from_address: Filtra pelo e-mail do remetente.
+            subject: Filtra por trecho do assunto.
+            since: Data mínima de recebimento, ex: '2025-01-01'.
+            unread_only: Só e-mails não lidos.
+            limit: Máximo de e-mails (1-100). Padrão: 20.
         """
-        filters = []
+        # A Graph exige que a propriedade do $orderby apareça primeiro no $filter.
+        filters = [f"receivedDateTime ge {since or '1900-01-01'}T00:00:00Z"]
         if from_address:
-            filters.append(f"from/emailAddress/address eq '{from_address}'")
+            filters.append(f"from/emailAddress/address eq '{odata_str(from_address)}'")
         if subject:
-            filters.append(f"contains(subject, '{subject}')")
-        if since:
-            filters.append(f"receivedDateTime ge {since}T00:00:00Z")
+            filters.append(f"contains(subject, '{odata_str(subject)}')")
+        if unread_only:
+            filters.append("isRead eq false")
 
-        params: dict = {
-            "$top": limit,
-            "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview",
-            "$orderby": "receivedDateTime desc",
-        }
-        if filters:
-            params["$filter"] = " and ".join(filters)
-
-        data = await graph.get(f"/me/mailFolders/{folder}/messages", params)
-        return [
+        data = await graph.get(
+            f"/me/mailFolders/{folder}/messages",
             {
-                "id": m["id"],
-                "subject": m.get("subject"),
-                "from": m.get("from", {}).get("emailAddress", {}).get("address"),
-                "received": m.get("receivedDateTime"),
-                "isRead": m.get("isRead"),
-                "preview": m.get("bodyPreview"),
-            }
-            for m in data.get("value", [])
-        ]
+                "$top": max(1, min(limit, 100)),
+                "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview",
+                "$filter": " and ".join(filters),
+                "$orderby": "receivedDateTime desc",
+            },
+        )
+        return [_summary(m) for m in data.get("value", [])]
 
     @mcp.tool()
     async def mail_get(message_id: str) -> dict:
-        """Lê um e-mail completo incluindo o corpo.
+        """Lê um e-mail completo, com corpo em texto e lista de anexos.
 
         Args:
-            message_id: ID da mensagem retornado por mail_list ou mail_search.
+            message_id: ID da mensagem (de mail_list ou mail_search).
         """
         m = await graph.get(
             f"/me/messages/{message_id}",
-            {"$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body"},
+            {
+                "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments",
+                "$expand": "attachments($select=name,contentType,size)",
+            },
+            headers={"Prefer": 'outlook.body-content-type="text"'},
         )
         return {
             "id": m["id"],
@@ -73,8 +84,11 @@ def register(mcp: FastMCP) -> None:
             "to": [r["emailAddress"]["address"] for r in m.get("toRecipients", [])],
             "cc": [r["emailAddress"]["address"] for r in m.get("ccRecipients", [])],
             "received": m.get("receivedDateTime"),
-            "bodyType": m.get("body", {}).get("contentType"),
             "body": m.get("body", {}).get("content"),
+            "attachments": [
+                {"name": a.get("name"), "type": a.get("contentType"), "size": a.get("size")}
+                for a in m.get("attachments", [])
+            ],
         }
 
     @mcp.tool()
@@ -88,36 +102,33 @@ def register(mcp: FastMCP) -> None:
         """Envia um e-mail.
 
         Args:
-            to: Lista de destinatários, ex: ['fulano@empresa.com'].
-            subject: Assunto do e-mail.
-            body: Corpo do e-mail.
-            cc: Lista de destinatários em cópia (opcional).
-            html: Se True, o corpo é HTML. Padrão: False.
+            to: Destinatários, ex: ['fulano@empresa.com'].
+            subject: Assunto.
+            body: Corpo.
+            cc: Destinatários em cópia (opcional).
+            html: True se o corpo for HTML. Padrão: texto simples.
         """
         message: dict = {
             "subject": subject,
             "body": {"contentType": "HTML" if html else "Text", "content": body},
-            "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+            "toRecipients": _recipients(to),
         }
         if cc:
-            message["ccRecipients"] = [{"emailAddress": {"address": a}} for a in cc]
-
+            message["ccRecipients"] = _recipients(cc)
         await graph.post("/me/sendMail", {"message": message, "saveToSentItems": True})
         return f"E-mail enviado para {', '.join(to)}."
 
     @mcp.tool()
-    async def mail_reply(message_id: str, body: str, html: bool = False) -> str:
+    async def mail_reply(message_id: str, body: str, reply_all: bool = False) -> str:
         """Responde a um e-mail.
 
         Args:
-            message_id: ID da mensagem a responder.
-            body: Corpo da resposta.
-            html: Se True, o corpo é HTML. Padrão: False.
+            message_id: ID da mensagem.
+            body: Texto da resposta.
+            reply_all: True para responder a todos.
         """
-        await graph.post(
-            f"/me/messages/{message_id}/reply",
-            {"message": {"body": {"contentType": "HTML" if html else "Text", "content": body}}},
-        )
+        action = "replyAll" if reply_all else "reply"
+        await graph.post(f"/me/messages/{message_id}/{action}", {"comment": body})
         return "Resposta enviada."
 
     @mcp.tool()
@@ -126,47 +137,35 @@ def register(mcp: FastMCP) -> None:
 
         Args:
             message_id: ID da mensagem.
-            destination_folder: Nome da pasta destino, ex: 'deleteditems', 'archive'.
+            destination_folder: 'inbox', 'archive', 'deleteditems', 'junkemail' ou ID de pasta.
         """
-        await graph.post(
-            f"/me/messages/{message_id}/move",
-            {"destinationId": destination_folder},
-        )
+        await graph.post(f"/me/messages/{message_id}/move", {"destinationId": destination_folder})
         return f"Mensagem movida para '{destination_folder}'."
 
     @mcp.tool()
     async def mail_delete(message_id: str) -> str:
-        """Deleta permanentemente um e-mail.
+        """Exclui um e-mail (vai para 'Itens Excluídos').
 
         Args:
             message_id: ID da mensagem.
         """
         await graph.delete(f"/me/messages/{message_id}")
-        return "E-mail deletado."
+        return "E-mail excluído."
 
     @mcp.tool()
     async def mail_search(query: str, limit: int = 20) -> list[dict]:
-        """Busca e-mails por texto livre (assunto, remetente, corpo).
+        """Busca e-mails em todas as pastas por texto (assunto, remetente, corpo).
 
         Args:
             query: Texto a buscar.
-            limit: Número máximo de resultados. Padrão: 20.
+            limit: Máximo de resultados (1-100). Padrão: 20.
         """
         data = await graph.get(
             "/me/messages",
             {
-                "$search": f'"{query}"',
-                "$top": limit,
-                "$select": "id,subject,from,receivedDateTime,bodyPreview",
+                "$search": f'"{query.replace(chr(34), "")}"',
+                "$top": max(1, min(limit, 100)),
+                "$select": "id,subject,from,receivedDateTime,isRead,bodyPreview",
             },
         )
-        return [
-            {
-                "id": m["id"],
-                "subject": m.get("subject"),
-                "from": m.get("from", {}).get("emailAddress", {}).get("address"),
-                "received": m.get("receivedDateTime"),
-                "preview": m.get("bodyPreview"),
-            }
-            for m in data.get("value", [])
-        ]
+        return [_summary(m) for m in data.get("value", [])]

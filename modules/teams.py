@@ -1,44 +1,40 @@
-"""Microsoft Teams via Microsoft Graph API."""
+"""Microsoft Teams."""
 
-from __future__ import annotations
-
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 import graph
 
 
-def register(mcp: FastMCP) -> None:
+def register(mcp: MCPServer) -> None:
 
     @mcp.tool()
     async def teams_list_chats(limit: int = 20) -> list[dict]:
-        """Lista as conversas (chats) recentes do Teams.
+        """Lista os chats do Teams mais recentes, com participantes e prévia da última mensagem.
 
         Args:
-            limit: Número máximo de conversas. Padrão: 20.
+            limit: Máximo de chats (1-50). Padrão: 20.
         """
         data = await graph.get(
             "/me/chats",
             {
-                "$top": limit,
-                "$select": "id,chatType,topic,lastUpdatedDateTime",
-                "$expand": "members($select=displayName,email)",
-                "$orderby": "lastUpdatedDateTime desc",
+                "$top": max(1, min(limit, 50)),
+                "$expand": "members,lastMessagePreview",
+                "$orderby": "lastMessagePreview/createdDateTime desc",
             },
         )
-        chats = []
-        for c in data.get("value", []):
-            members = [
-                m.get("displayName") or m.get("email", "")
-                for m in c.get("members", [])
-            ]
-            chats.append({
+        return [
+            {
                 "id": c["id"],
                 "type": c.get("chatType"),
                 "topic": c.get("topic"),
-                "members": members,
-                "lastUpdated": c.get("lastUpdatedDateTime"),
-            })
-        return chats
+                "members": [m.get("displayName") for m in c.get("members", [])],
+                "lastMessage": (c.get("lastMessagePreview") or {}).get("body", {}).get("content"),
+                "lastMessageAt": (c.get("lastMessagePreview") or {}).get("createdDateTime"),
+                "webUrl": c.get("webUrl"),
+            }
+            for c in data.get("value", [])
+        ]
 
     @mcp.tool()
     async def teams_send_message(
@@ -48,27 +44,22 @@ def register(mcp: FastMCP) -> None:
         channel_id: str | None = None,
         html: bool = False,
     ) -> str:
-        """Envia uma mensagem em um chat ou canal do Teams.
+        """Envia uma mensagem em um chat ou em um canal do Teams.
 
-        Forneça 'chat_id' para chats diretos/grupos, ou 'team_id' + 'channel_id' para canais.
+        Informe `chat_id` (chat individual/grupo) OU `team_id` + `channel_id` (canal).
 
         Args:
-            body: Corpo da mensagem.
-            chat_id: ID do chat (retornado por teams_list_chats). Use este OU team_id+channel_id.
-            team_id: ID do time. Use junto com channel_id.
+            body: Texto da mensagem.
+            chat_id: ID do chat (de teams_list_chats).
+            team_id: ID do time.
             channel_id: ID do canal.
-            html: Se True, o corpo é HTML. Padrão: False.
+            html: True se o corpo for HTML.
         """
-        content_type = "html" if html else "text"
-        message_body = {"body": {"contentType": content_type, "content": body}}
-
+        message = {"body": {"contentType": "html" if html else "text", "content": body}}
         if chat_id:
-            await graph.post(f"/chats/{chat_id}/messages", message_body)
-            return f"Mensagem enviada no chat '{chat_id}'."
-        elif team_id and channel_id:
-            await graph.post(
-                f"/teams/{team_id}/channels/{channel_id}/messages", message_body
-            )
-            return f"Mensagem enviada no canal '{channel_id}' do time '{team_id}'."
-        else:
-            raise ValueError("Forneça 'chat_id' ou 'team_id' + 'channel_id'.")
+            await graph.post(f"/chats/{chat_id}/messages", message)
+            return "Mensagem enviada no chat."
+        if team_id and channel_id:
+            await graph.post(f"/teams/{team_id}/channels/{channel_id}/messages", message)
+            return "Mensagem enviada no canal."
+        raise ToolError("Informe 'chat_id' ou 'team_id' + 'channel_id'.")

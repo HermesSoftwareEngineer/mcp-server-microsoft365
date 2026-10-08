@@ -1,72 +1,85 @@
-"""Agenda (Calendar) via Microsoft Graph API."""
+"""Outlook — agenda. Datas sem fuso são interpretadas no fuso de TIMEZONE."""
 
-from __future__ import annotations
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
+import config
 import graph
 
+TZ_HEADER = {"Prefer": f'outlook.timezone="{config.TIMEZONE}"'}
 
-def register(mcp: FastMCP) -> None:
+
+def _with_offset(value: str, end_of_day: bool = False) -> str:
+    if "T" not in value:
+        value += "T23:59:59" if end_of_day else "T00:00:00"
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    return dt.isoformat()
+
+
+def _when(value: str) -> dict:
+    return {"dateTime": value, "timeZone": config.TIMEZONE}
+
+
+def _summary(e: dict) -> dict:
+    return {
+        "id": e["id"],
+        "subject": e.get("subject"),
+        "start": e.get("start", {}).get("dateTime"),
+        "end": e.get("end", {}).get("dateTime"),
+        "isAllDay": e.get("isAllDay"),
+        "location": e.get("location", {}).get("displayName"),
+        "organizer": e.get("organizer", {}).get("emailAddress", {}).get("address"),
+        "onlineMeetingUrl": (e.get("onlineMeeting") or {}).get("joinUrl"),
+    }
+
+
+def register(mcp: MCPServer) -> None:
 
     @mcp.tool()
     async def calendar_list_events(start: str, end: str) -> list[dict]:
-        """Lista eventos da agenda em um intervalo de datas.
+        """Lista eventos (incluindo ocorrências de recorrentes) entre duas datas.
 
         Args:
-            start: Data/hora de início, ex: '2025-10-01' ou '2025-10-01T08:00:00'.
-            end: Data/hora de fim, ex: '2025-10-31' ou '2025-10-31T23:59:59'.
+            start: Início, ex: '2025-10-01' ou '2025-10-01T08:00:00'.
+            end: Fim, ex: '2025-10-31' ou '2025-10-31T18:00:00'.
         """
-        if "T" not in start:
-            start += "T00:00:00"
-        if "T" not in end:
-            end += "T23:59:59"
-
-        data = await graph.get(
+        events = await graph.get_all(
             "/me/calendarView",
             {
-                "startDateTime": start,
-                "endDateTime": end,
-                "$select": "id,subject,start,end,location,organizer,isAllDay",
+                "startDateTime": _with_offset(start),
+                "endDateTime": _with_offset(end, end_of_day=True),
+                "$select": "id,subject,start,end,location,organizer,isAllDay,onlineMeeting",
                 "$orderby": "start/dateTime",
                 "$top": 100,
             },
+            headers=TZ_HEADER,
         )
-        return [
-            {
-                "id": e["id"],
-                "subject": e.get("subject"),
-                "start": e.get("start", {}).get("dateTime"),
-                "end": e.get("end", {}).get("dateTime"),
-                "isAllDay": e.get("isAllDay"),
-                "location": e.get("location", {}).get("displayName"),
-                "organizer": e.get("organizer", {}).get("emailAddress", {}).get("address"),
-            }
-            for e in data.get("value", [])
-        ]
+        return [_summary(e) for e in events]
 
     @mcp.tool()
     async def calendar_get_event(event_id: str) -> dict:
-        """Retorna os detalhes completos de um evento.
+        """Detalha um evento, com descrição e participantes.
 
         Args:
-            event_id: ID do evento retornado por calendar_list_events.
+            event_id: ID do evento.
         """
-        e = await graph.get(f"/me/events/{event_id}")
+        e = await graph.get(
+            f"/me/events/{event_id}",
+            headers={"Prefer": f'{TZ_HEADER["Prefer"]}, outlook.body-content-type="text"'},
+        )
         return {
-            "id": e["id"],
-            "subject": e.get("subject"),
-            "start": e.get("start"),
-            "end": e.get("end"),
-            "isAllDay": e.get("isAllDay"),
-            "location": e.get("location", {}).get("displayName"),
+            **_summary(e),
             "body": e.get("body", {}).get("content"),
-            "organizer": e.get("organizer", {}).get("emailAddress", {}).get("address"),
             "attendees": [
                 {
                     "email": a["emailAddress"]["address"],
                     "name": a["emailAddress"].get("name"),
-                    "status": a.get("status", {}).get("response"),
+                    "response": a.get("status", {}).get("response"),
                 }
                 for a in e.get("attendees", [])
             ],
@@ -81,22 +94,24 @@ def register(mcp: FastMCP) -> None:
         location: str | None = None,
         body: str | None = None,
         is_all_day: bool = False,
+        teams_meeting: bool = False,
     ) -> dict:
-        """Cria um novo evento na agenda.
+        """Cria um evento. Se houver participantes, eles recebem o convite.
 
         Args:
-            title: Título do evento.
-            start: Data/hora de início, ex: '2025-10-15T14:00:00'.
-            end: Data/hora de fim, ex: '2025-10-15T15:00:00'.
-            attendees: Lista de e-mails dos participantes (opcional).
-            location: Local do evento (opcional).
-            body: Descrição do evento (opcional).
-            is_all_day: Se True, cria como evento de dia inteiro. Padrão: False.
+            title: Título.
+            start: Início, ex: '2025-10-15T14:00:00' (para dia inteiro: '2025-10-15T00:00:00').
+            end: Fim, ex: '2025-10-15T15:00:00' (para dia inteiro: o dia seguinte às 00:00).
+            attendees: E-mails dos participantes (opcional).
+            location: Local (opcional).
+            body: Descrição (opcional).
+            is_all_day: Evento de dia inteiro.
+            teams_meeting: Cria reunião online do Teams.
         """
         event: dict = {
             "subject": title,
-            "start": {"dateTime": start, "timeZone": "America/Sao_Paulo"},
-            "end": {"dateTime": end, "timeZone": "America/Sao_Paulo"},
+            "start": _when(start),
+            "end": _when(end),
             "isAllDay": is_all_day,
         }
         if attendees:
@@ -107,9 +122,12 @@ def register(mcp: FastMCP) -> None:
             event["location"] = {"displayName": location}
         if body:
             event["body"] = {"contentType": "Text", "content": body}
+        if teams_meeting:
+            event["isOnlineMeeting"] = True
+            event["onlineMeetingProvider"] = "teamsForBusiness"
 
         result = await graph.post("/me/events", event)
-        return {"id": result["id"], "subject": result["subject"], "webLink": result.get("webLink")}
+        return {**_summary(result), "webLink": result.get("webLink")}
 
     @mcp.tool()
     async def calendar_update_event(
@@ -120,40 +138,42 @@ def register(mcp: FastMCP) -> None:
         location: str | None = None,
         body: str | None = None,
     ) -> dict:
-        """Atualiza campos de um evento existente.
+        """Atualiza campos de um evento. Só os campos informados são alterados.
 
         Args:
             event_id: ID do evento.
-            title: Novo título (opcional).
-            start: Nova data/hora de início, ex: '2025-10-15T14:00:00' (opcional).
-            end: Nova data/hora de fim (opcional).
-            location: Novo local (opcional).
-            body: Nova descrição (opcional).
+            title: Novo título.
+            start: Novo início, ex: '2025-10-15T14:00:00'.
+            end: Novo fim.
+            location: Novo local.
+            body: Nova descrição.
         """
         updates: dict = {}
         if title is not None:
             updates["subject"] = title
         if start is not None:
-            updates["start"] = {"dateTime": start, "timeZone": "America/Sao_Paulo"}
+            updates["start"] = _when(start)
         if end is not None:
-            updates["end"] = {"dateTime": end, "timeZone": "America/Sao_Paulo"}
+            updates["end"] = _when(end)
         if location is not None:
             updates["location"] = {"displayName": location}
         if body is not None:
             updates["body"] = {"contentType": "Text", "content": body}
+        if not updates:
+            raise ToolError("Informe ao menos um campo para atualizar.")
 
         await graph.patch(f"/me/events/{event_id}", updates)
-        return {"id": event_id, "updated": list(updates.keys())}
+        return {"id": event_id, "updated": list(updates)}
 
     @mcp.tool()
     async def calendar_delete_event(event_id: str) -> str:
-        """Deleta um evento da agenda.
+        """Exclui um evento. Se você for o organizador, os participantes recebem o cancelamento.
 
         Args:
             event_id: ID do evento.
         """
         await graph.delete(f"/me/events/{event_id}")
-        return f"Evento '{event_id}' deletado."
+        return f"Evento '{event_id}' excluído."
 
     @mcp.tool()
     async def calendar_find_free_slots(
@@ -162,36 +182,36 @@ def register(mcp: FastMCP) -> None:
         start: str,
         end: str,
     ) -> list[dict]:
-        """Encontra horários livres entre os participantes.
+        """Sugere horários em que todos os participantes (e você) estão livres.
 
         Args:
-            attendees: Lista de e-mails dos participantes.
-            duration_minutes: Duração desejada da reunião em minutos.
-            start: Data/hora de início da janela de busca, ex: '2025-10-15T08:00:00'.
-            end: Data/hora de fim da janela de busca, ex: '2025-10-15T18:00:00'.
+            attendees: E-mails dos participantes.
+            duration_minutes: Duração da reunião em minutos.
+            start: Início da janela de busca, ex: '2025-10-15T08:00:00'.
+            end: Fim da janela de busca, ex: '2025-10-17T18:00:00'.
         """
-        body = {
-            "attendees": [
-                {"emailAddress": {"address": a}, "type": "required"} for a in attendees
-            ],
-            "timeConstraint": {
-                "timeslots": [
-                    {
-                        "start": {"dateTime": start, "timeZone": "America/Sao_Paulo"},
-                        "end": {"dateTime": end, "timeZone": "America/Sao_Paulo"},
-                    }
-                ]
+        data = await graph.post(
+            "/me/findMeetingTimes",
+            {
+                "attendees": [
+                    {"emailAddress": {"address": a}, "type": "required"} for a in attendees
+                ],
+                "timeConstraint": {
+                    "activityDomain": "work",
+                    "timeSlots": [{"start": _when(start), "end": _when(end)}],
+                },
+                "meetingDuration": f"PT{duration_minutes}M",
+                "minimumAttendeePercentage": 100,
+                "maxCandidates": 20,
             },
-            "meetingDuration": f"PT{duration_minutes}M",
-            "returnSuggestionReasons": True,
-            "minimumAttendeePercentage": 100,
-        }
-        data = await graph.post("/me/findMeetingTimes", body)
+            headers=TZ_HEADER,
+        )
         return [
             {
                 "start": s["meetingTimeSlot"]["start"]["dateTime"],
                 "end": s["meetingTimeSlot"]["end"]["dateTime"],
+                "timeZone": s["meetingTimeSlot"]["start"].get("timeZone"),
                 "confidence": s.get("confidence"),
             }
             for s in data.get("meetingTimeSuggestions", [])
-        ]
+        ] or [{"message": data.get("emptySuggestionsReason", "Nenhum horário livre encontrado.")}]

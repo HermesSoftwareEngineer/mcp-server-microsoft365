@@ -1,109 +1,104 @@
-"""Cliente HTTP base para a Microsoft Graph API."""
+"""Cliente HTTP da Microsoft Graph API, autenticado como o usuário da requisição MCP atual."""
 
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.mcpserver.exceptions import ToolError
 
-from auth import get_access_token
+import microsoft
 
 BASE_URL = "https://graph.microsoft.com/v1.0"
 
-
-async def _headers() -> dict:
-    token = await get_access_token()
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+_client = httpx.AsyncClient(timeout=60, follow_redirects=True)
 
 
-async def get(path: str, params: dict | None = None) -> Any:
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            BASE_URL + path,
-            headers=await _headers(),
-            params=params,
-            timeout=30,
+def odata_str(value: str) -> str:
+    """Escapa um literal de string OData (aspas simples duplicadas)."""
+    return value.replace("'", "''")
+
+
+def drive_path(path: str) -> str:
+    return quote(path.strip("/"), safe="/")
+
+
+def _current_subject() -> str:
+    token = get_access_token()
+    if token is None or token.subject is None:
+        raise ToolError("Requisição sem usuário autenticado.")
+    return token.subject
+
+
+async def _request(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    subject = _current_subject()
+    if not url.startswith("https://"):
+        url = BASE_URL + url
+    extra_headers = kwargs.pop("headers", {})
+
+    for attempt in range(2):
+        token = await microsoft.get_valid_token(subject, force_refresh=attempt > 0)
+        resp = await _client.request(
+            method, url, headers={"Authorization": f"Bearer {token}", **extra_headers}, **kwargs
         )
-        _raise(resp)
-        return resp.json()
+        if resp.status_code != 401:
+            break
+    _raise(resp)
+    return resp
 
 
-async def get_all(path: str, params: dict | None = None) -> list:
+async def get(path: str, params: dict | None = None, headers: dict | None = None) -> Any:
+    return (await _request("GET", path, params=params, headers=headers or {})).json()
+
+
+async def get_all(path: str, params: dict | None = None, headers: dict | None = None) -> list:
     """GET com paginação automática via @odata.nextLink."""
     items: list = []
-    url: str | None = BASE_URL + path
-    p = params
-    async with httpx.AsyncClient() as client:
-        while url:
-            resp = await client.get(
-                url,
-                headers=await _headers(),
-                params=p,
-                timeout=30,
-            )
-            _raise(resp)
-            data = resp.json()
-            items.extend(data.get("value", []))
-            url = data.get("@odata.nextLink")
-            p = None  # nextLink já carrega os parâmetros
+    url: str | None = path
+    while url:
+        data = (await _request("GET", url, params=params, headers=headers or {})).json()
+        items.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")
+        params = None  # o nextLink já carrega os parâmetros
     return items
 
 
-async def post(path: str, body: dict) -> Any:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            BASE_URL + path,
-            headers=await _headers(),
-            json=body,
-            timeout=30,
-        )
-        _raise(resp)
-        if resp.status_code == 204:
-            return {}
-        return resp.json()
+async def get_content(path: str) -> bytes:
+    return (await _request("GET", path)).content
+
+
+async def post(path: str, body: dict, headers: dict | None = None) -> Any:
+    resp = await _request("POST", path, json=body, headers=headers or {})
+    return resp.json() if resp.content else {}
 
 
 async def patch(path: str, body: dict) -> Any:
-    async with httpx.AsyncClient() as client:
-        resp = await client.patch(
-            BASE_URL + path,
-            headers=await _headers(),
-            json=body,
-            timeout=30,
-        )
-        _raise(resp)
-        if resp.status_code == 204:
-            return {}
-        return resp.json()
+    resp = await _request("PATCH", path, json=body)
+    return resp.json() if resp.content else {}
 
 
 async def delete(path: str) -> None:
-    async with httpx.AsyncClient() as client:
-        resp = await client.delete(
-            BASE_URL + path,
-            headers=await _headers(),
-            timeout=30,
-        )
-        _raise(resp)
+    await _request("DELETE", path)
 
 
 async def put_bytes(path: str, data: bytes, content_type: str = "application/octet-stream") -> Any:
-    headers = await _headers()
-    headers["Content-Type"] = content_type
-    async with httpx.AsyncClient() as client:
-        resp = await client.put(BASE_URL + path, headers=headers, content=data, timeout=60)
-        _raise(resp)
-        return resp.json()
+    resp = await _request("PUT", path, content=data, headers={"Content-Type": content_type})
+    return resp.json()
 
 
 def _raise(resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    try:
+        error = resp.json().get("error", {})
+        detail = f"{error.get('code', '')}: {error.get('message', '')}"
+    except ValueError:
+        detail = resp.text[:500]
     if resp.status_code == 404:
-        raise ValueError(f"Recurso não encontrado: {resp.url}")
+        raise ToolError(f"Recurso não encontrado ({detail})")
     if resp.status_code == 403:
-        raise PermissionError(
-            f"Permissão negada. Verifique os scopes do app Azure. URL: {resp.url}"
+        raise ToolError(
+            f"Permissão negada pela Microsoft ({detail}). Verifique se o app no Entra ID "
+            "tem a permissão delegada necessária e se o consentimento foi concedido."
         )
-    if resp.status_code >= 400:
-        try:
-            detail = resp.json().get("error", {}).get("message", resp.text)
-        except Exception:
-            detail = resp.text
-        raise RuntimeError(f"Graph API {resp.status_code}: {detail}")
+    raise ToolError(f"Graph API {resp.status_code} ({detail})")
